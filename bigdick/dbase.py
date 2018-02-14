@@ -1,26 +1,97 @@
 import time
 import json
 import queue
+import logging
 import pathlib
 import threading
 from collections import namedtuple
 
 
-class DBase:
-    DB_DIRECTION = 'db/'
-    DB_NAME_PREFIX, DB_NAME_SUFFIX = 'storage', 'db'
-    DB_TUPLE = namedtuple('DB_TUPLE', ['stamp', 'key', 'value'])
-    DB_MAX_SIZE = 8 * 1024 * 1024
-    DB_INDEX_TUPLE = namedtuple('DB_INDEX_TUPLE', ['file', 'offset'])
-    CACHE_SIZE = 64
-    CACHE_TUPLE = namedtuple('CACHE_TUPLE', ['stamp', 'value'])
+class _SafeDict(dict):
+    def __init__(self):
+        dict.__init__(self)
+        self._lock = threading.Lock()
+
+    def __getitem__(self, key):
+        self._lock.acquire()
+        value = dict.__getitem__(self, key)
+        self._lock.release()
+        return value
+
+    def __setitem__(self, key, value):
+        self._lock.acquire()
+        dict.__setitem__(self, key, value)
+        self._lock.release()
+
+    def __delitem__(self, key):
+        self._lock.acquire()
+        dict.__delitem__(self, key)
+        self._lock.release()
+
+
+class _Cache(_SafeDict):
+    CACHE_SIZE = 0
     CACHE_DURATION = 60.0
 
+    def __init__(self, index):
+        _SafeDict.__init__(self)
+        self._index = index
+        self._setitem_history = queue.Queue()
+
+    def __setitem__(self, key, value):
+        if len(self) > self.CACHE_SIZE and key not in self:
+            return
+        self._setitem_history.put((time.time(), key))
+        _SafeDict.__setitem__(self, key, value)
+
+    def free_cache(self):
+        # stamps for comparing
+        (stamp_operation, key), _ = self._setitem_history.get(), self._setitem_history.task_done()
+        if key not in self:
+            return
+        stamp_cache, _ = self[key]
+
+        # system clock changed
+        current_time = time.time()
+        if current_time < stamp_cache or current_time < stamp_operation:
+            logging.warning('system clock changed')
+            return
+
+        # stamp_1 != stamp_2, current cache is alive and do not free it
+        if not (abs(stamp_cache - stamp_operation) < 1e-1):
+            return
+
+        # wait until stamp_operation is old enough
+        while True:
+            current_time = time.time()
+            if current_time - stamp_operation > self.CACHE_DURATION:
+                break
+            time.sleep(2.0)
+
+        # check stamp_cache again
+        stamp_cache, _ = self[key]
+        if not (abs(stamp_cache - stamp_operation) < 1e-1):  # stamp_1 != stamp_2, cache updated
+            return
+        del self[key]
+
+
+class _Index(_SafeDict):
+    pass
+
+
+class _DBase:
+    DB_DIRECTION = 'db/'
+    DB_NAME_PREFIX, DB_NAME_SUFFIX = 'storage', 'db'
+    DB_MAX_SIZE = 8 * 1024 * 1024
+    CACHE_SIZE = 0
+    #
+    DB_TUPLE = namedtuple('DB_TUPLE', ['stamp', 'key', 'value'])
+    INDEX_TUPLE = namedtuple('DB_INDEX_TUPLE', ['file', 'offset'])
+    CACHE_TUPLE = namedtuple('CACHE_TUPLE', ['stamp', 'value'])
+
     def __init__(self):
-        self._index = dict()
-        self._index_lock = threading.Lock()
-        self._cache = dict()
-        self._cache_lock = threading.Lock()
+        self._index = _Index()
+        self._cache = _Cache(index=self._index)
 
         # init db direction
         self._db_direction = pathlib.Path(self.DB_DIRECTION)
@@ -61,8 +132,8 @@ class DBase:
         self._stop_flag = False
 
         # cache update thread
-        self._cache_arrange_thread = threading.Thread(target=self._arrange_cache)
-        self._cache_arrange_thread.start()
+        self._cache_free_thread = threading.Thread(target=self._free_cache)
+        self._cache_free_thread.start()
 
         # storage merge thread
 
@@ -76,34 +147,21 @@ class DBase:
                 break
             time.sleep(10.0)
 
-    def _arrange_cache(self):
+    def _free_cache(self):
         while True:
             if self._stop_flag:
                 break
-            if len(self._cache) < self.CACHE_SIZE // 2:
+            if len(self._cache) < self.CACHE_SIZE * 0.8:
                 time.sleep(2.0)
                 continue
-            self._cache_lock.acquire()
-            # stamp, _ = self._cache[key]
-            self._cache_lock.release()
+            self._cache.free_cache()
 
     def _merge_storage(self):
-        # reduce per db file
-        def task_reduce():
-            pass
-
-        # merge different db file
-        def task_merge():
-            pass
-
-        while True:
-            if self._stop_flag:
-                break
-            time.sleep(60.0)
+        pass
 
     def stop(self):
         self._stop_flag = True
-        self._cache_arrange_thread.join()
+        self._cache_free_thread.join()
 
     def _switch_active_db(self):
         # validate the new storage file
@@ -131,15 +189,13 @@ class DBase:
         if self._active_file is None or self._active_file.tell() > self.DB_MAX_SIZE:
             self._switch_active_db()
 
-        # update in-memory index
-        self._index[key] = self.DB_INDEX_TUPLE(file=self._db_files[-1],
-                                               offset=self._active_file.tell())
-
         # write to cache
-        self._cache_lock.acquire()
         self._cache[key] = self.CACHE_TUPLE(stamp=time.time(),
                                             value=value)
-        self._cache_lock.release()
+
+        # update in-memory index
+        self._index[key] = self.INDEX_TUPLE(file=self._db_files[-1],
+                                            offset=self._active_file.tell())
 
         # write to disk
         print(json.dumps(buffer), end='\n', file=self._active_file, flush=True)
@@ -150,7 +206,6 @@ class DBase:
             return default
 
         # check cache
-        self._cache_lock.acquire()
         if key in self._cache:
             # hint
             _, value = self._cache[key]
@@ -164,14 +219,17 @@ class DBase:
         # cache it (or update stamp)
         self._cache[key] = self.CACHE_TUPLE(stamp=time.time(),
                                             value=value)
-        self._cache_lock.release()
         return value
+
+
+class DB(_DBase):
+    pass
 
 
 def test_db():
     import random
 
-    db = DBase()
+    db = DB()
     table = dict()
 
     def update():
@@ -182,7 +240,7 @@ def test_db():
             table[key] = value
             db.update(key, value)
         after = time.time()
-        print('Update QPS: {}'.format(0xFFFF / (after - before)))
+        print('Update QPS: {:.2f}'.format(0xFFFF / (after - before)))
         #
         for key in table:
             value = table[key]
@@ -197,7 +255,7 @@ def test_db():
             key = random.randrange(0xFF)
             db.get(key)
         after = time.time()
-        print('Get QPS: {}'.format(0xFFFFF / (after - before)))
+        print('Get QPS: {:.2f}'.format(0xFFFFF / (after - before)))
 
     get()
     db.stop()
