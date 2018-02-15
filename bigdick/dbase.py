@@ -30,22 +30,24 @@ class _SafeDict(dict):
 
 
 class _Cache(_SafeDict):
-    CACHE_SIZE = 0
-    CACHE_DURATION = 60.0
-
-    def __init__(self, index):
+    def __init__(self, index, cache_size, cache_duration):
         _SafeDict.__init__(self)
         self._index = index
+        self._cache_size = cache_size
+        self._cache_duration = cache_duration
         self._setitem_history = queue.Queue()
 
     def __setitem__(self, key, value):
-        if len(self) > self.CACHE_SIZE and key not in self:
+        if len(self) >= self._cache_size and key not in self:
             return
         self._setitem_history.put((time.time(), key))
         _SafeDict.__setitem__(self, key, value)
 
     def free_cache(self):
         # stamps for comparing
+        if self._setitem_history.unfinished_tasks == 0:
+            time.sleep(1.0)
+            return
         (stamp_operation, key), _ = self._setitem_history.get(), self._setitem_history.task_done()
         if key not in self:
             return
@@ -64,7 +66,7 @@ class _Cache(_SafeDict):
         # wait until stamp_operation is old enough
         while True:
             current_time = time.time()
-            if current_time - stamp_operation > self.CACHE_DURATION:
+            if current_time - stamp_operation > self._cache_duration:
                 break
             time.sleep(2.0)
 
@@ -73,6 +75,7 @@ class _Cache(_SafeDict):
         if not (abs(stamp_cache - stamp_operation) < 1e-1):  # stamp_1 != stamp_2, cache updated
             return
         del self[key]
+        # print('free: {0}, len: {1}'.format(key, len(self)))
 
 
 class _Index(_SafeDict):
@@ -80,21 +83,23 @@ class _Index(_SafeDict):
 
 
 class _DBase:
-    DB_DIRECTION = 'db/'
     DB_NAME_PREFIX, DB_NAME_SUFFIX = 'storage', 'db'
-    DB_MAX_SIZE = 8 * 1024 * 1024
-    CACHE_SIZE = 0
     #
     DB_TUPLE = namedtuple('DB_TUPLE', ['stamp', 'key', 'value'])
     INDEX_TUPLE = namedtuple('DB_INDEX_TUPLE', ['file', 'offset'])
     CACHE_TUPLE = namedtuple('CACHE_TUPLE', ['stamp', 'value'])
 
-    def __init__(self):
+    def __init__(self, db_direction='db/', db_filesize=8 * 1024 * 1024, cache_size=1024, cache_duration=60.0):
+        # config file
+        self._db_filesize = db_filesize
+        self._cache_size = cache_size
+
         self._index = _Index()
-        self._cache = _Cache(index=self._index)
+        self._cache = _Cache(index=self._index, cache_size=cache_size, cache_duration=cache_duration)
+        self._lock = threading.Lock()  # this lock is for file operations in different thread
 
         # init db direction
-        self._db_direction = pathlib.Path(self.DB_DIRECTION)
+        self._db_direction = pathlib.Path(db_direction)
         if not self._db_direction.exists():
             self._db_direction.mkdir()
         if not self._db_direction.is_dir():
@@ -151,13 +156,14 @@ class _DBase:
         while True:
             if self._stop_flag:
                 break
-            if len(self._cache) < self.CACHE_SIZE * 0.8:
+            if len(self._cache) < self._cache_size * 0.8:
                 time.sleep(2.0)
                 continue
             self._cache.free_cache()
 
     def _merge_storage(self):
-        pass
+        self._lock.acquire()
+        self._lock.release()
 
     def stop(self):
         self._stop_flag = True
@@ -180,13 +186,15 @@ class _DBase:
         self._active_file = writer
 
     def update(self, key, value):
+        self._lock.acquire()
+
         # format value ready for storage
         buffer = self.DB_TUPLE(stamp=time.time(),
                                key=key,
                                value=value)
 
         # check storage file status
-        if self._active_file is None or self._active_file.tell() > self.DB_MAX_SIZE:
+        if self._active_file is None or self._active_file.tell() > self._db_filesize:
             self._switch_active_db()
 
         # write to cache
@@ -200,7 +208,11 @@ class _DBase:
         # write to disk
         print(json.dumps(buffer), end='\n', file=self._active_file, flush=True)
 
+        self._lock.release()
+
     def get(self, key, default=None):
+        self._lock.acquire()
+
         # check key valid
         if key not in self._index:
             return default
@@ -219,6 +231,8 @@ class _DBase:
         # cache it (or update stamp)
         self._cache[key] = self.CACHE_TUPLE(stamp=time.time(),
                                             value=value)
+
+        self._lock.release()
         return value
 
 
@@ -229,34 +243,19 @@ class DB(_DBase):
 def test_db():
     import random
 
-    db = DB()
-    table = dict()
+    db = DB(cache_size=64, cache_duration=10.0)
 
     def update():
-        before = time.time()
         for i in range(0xFFFF):
-            key = random.randrange(0xFF)
-            value = random.randrange(0xFFFFFFFF)
-            table[key] = value
+            key, value = random.randrange(0xFF), random.randrange(0xFFFFFFFF)
             db.update(key, value)
-        after = time.time()
-        print('Update QPS: {:.2f}'.format(0xFFFF / (after - before)))
-        #
-        for key in table:
-            value = table[key]
-            assert value == db.get(key)
-
     update()
-    time.sleep(5.0)
 
     def get():
-        before = time.time()
-        for i in range(0xFFFFF):
+        for i in range(0xFFFF):
             key = random.randrange(0xFF)
             db.get(key)
-        after = time.time()
-        print('Get QPS: {:.2f}'.format(0xFFFFF / (after - before)))
-
+            time.sleep(0.1)
     get()
     db.stop()
 
