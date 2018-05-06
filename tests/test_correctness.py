@@ -7,6 +7,53 @@ import threading
 import bigdick
 
 
+def test_reopen():
+    ops_write, ops_read = 0xFFFF, 0xFFFF
+    cache_size = 0
+    tmp_dict = dict()
+    tmp_dir = tempfile.mkdtemp()
+
+    def runtime_space_1():
+        db = bigdick.DB(db_direction=tmp_dir, cache_size=cache_size, cache_duration=10.0)
+
+        def update():
+            for _ in range(ops_write):
+                key, value = random.randrange(0xFF), random.randrange(0xFFFF_FFFF)
+                tmp_dict[key] = value
+                db.update(key, value)
+            print('{} write options finished'.format(ops_write))
+        update()
+
+        def get():
+            keys = [random.randrange(0xFF) for _ in range(ops_read)]
+            for key in keys:
+                value_1 = tmp_dict[key]
+                value_2 = db.get(key)
+                assert value_1 == value_2
+            print('{} read options finished'.format(ops_read))
+        get()
+        db.stop()
+
+    def runtime_space_2():
+        db = bigdick.DB(db_direction=tmp_dir, cache_size=cache_size, cache_duration=10.0)
+
+        def get():
+            keys = [random.randrange(0xFF) for _ in range(ops_read)]
+            for key in keys:
+                value_1 = tmp_dict[key]
+                value_2 = db.get(key)
+                assert value_1 == value_2
+            print('{} read options finished'.format(ops_read))
+        get()
+        db.stop()
+
+    print('open db')
+    runtime_space_1()
+    print('reopen db')
+    runtime_space_2()
+    shutil.rmtree(tmp_dir)
+
+
 def test_cache():
     # test correctness without cache, small cache and huge cache
     ops_write, ops_read = 0xFFF, 0xFFFFF
@@ -40,6 +87,7 @@ def test_cache():
                 print('cache_size: {}, Get QPS: {:.2f}'.format(cache_sizes[i], ops_read / (after - before + 1e-3)))
             get()
             db.stop()
+
         runtime_space()
         shutil.rmtree(tmp_dir)
         time.sleep(2.0)
@@ -113,14 +161,18 @@ def test_threading():
 
 
 if __name__ == '__main__':
-    print('test_cache:')
+    print('-------------- test reopen --------------')
+    test_reopen()
+    print('')
+
+    print('-------------- test_cache -----------------')
     test_cache()
     print('')
 
-    print('test_efficiency:')
+    print('-------------- test_efficiency --------------')
     test_efficiency()
     print('')
 
-    print('test_threading:')
+    print('-------------- test_threading --------------')
     test_threading()
     print('')

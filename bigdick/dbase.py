@@ -105,7 +105,7 @@ class _DBase:
         if not self._db_direction.is_dir():
             raise RuntimeError('not a dir DB_PATH: {}'.format(self._db_direction))
 
-        # check valid and sort files
+        # check db files valid and ready them in order
         files = []
         for file in self._db_direction.iterdir():
             if not file.is_file():
@@ -124,7 +124,7 @@ class _DBase:
                                             idx,
                                             self.DB_NAME_SUFFIX)
                 new_file = self._db_direction.joinpath(name)
-                assert not new_file.exists()
+                assert not new_file.exists()  # do not destroy existing file
                 file.replace(new_file)
                 files[idx] = new_file
 
@@ -132,6 +132,17 @@ class _DBase:
         self._db_files = [file.open(mode='r', encoding='utf-8') for file in files]
         self._num_dbs = len(self._db_files)
         self._active_file = None
+
+        # rebuild index
+        for file in self._db_files:
+            while True:
+                offset = file.tell()
+                line = file.readline()
+                if not line:
+                    break
+                stamp, key, value = json.loads(line)
+                self._index[key] = self.INDEX_TUPLE(file=file,
+                                                    offset=offset)
 
         # exit flag for background threads
         self._stop_flag = False
@@ -179,7 +190,7 @@ class _DBase:
         self._num_dbs += 1
 
         # create it
-        writer, reader = child.open(mode='a'), child.open(mode='r')
+        writer, reader = child.open(mode='a', encoding='utf-8'), child.open(mode='r', encoding='utf-8')
         self._db_files.append(reader)
         if self._active_file is not None:
             self._active_file.close()
